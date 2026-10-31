@@ -1,0 +1,362 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Crear proyecto
+        run: |
+          set -e
+          mkdir -p src && cd src
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MIRAndroid"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mirandroid.launcher"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.mirandroid.launcher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:glEsVersion="0x00030001" android:required="true" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="MIR Android"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".GameActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:screenOrientation="sensorLandscape" />
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/GameImporter.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.documentfile.provider.DocumentFile
+          import java.io.File
+
+          /** Copia la carpeta elegida por el usuario (SAF) al almacenamiento interno de la app. */
+          object GameImporter {
+
+              fun gameDir(ctx: Context): File = File(ctx.filesDir, "game")
+
+              fun isImported(ctx: Context): Boolean {
+                  val d = gameDir(ctx)
+                  return File(d, "MIR.dll").exists() || File(d, "MIR.exe").exists()
+              }
+
+              /** Devuelve la carpeta raiz del juego (la elegida, o una subcarpeta directa que contenga MIR.dll/exe). */
+              fun findGameRoot(tree: DocumentFile): DocumentFile? {
+                  if (looksLikeGame(tree)) return tree
+                  return tree.listFiles().firstOrNull { it.isDirectory && looksLikeGame(it) }
+              }
+
+              private fun looksLikeGame(dir: DocumentFile): Boolean =
+                  dir.findFile("MIR.dll") != null || dir.findFile("MIR.exe") != null
+
+              fun import(
+                  ctx: Context,
+                  treeUri: Uri,
+                  onProgress: (copiedFiles: Int, currentName: String) -> Unit
+              ): Result<Int> = runCatching {
+                  val tree = DocumentFile.fromTreeUri(ctx, treeUri)
+                      ?: error("No se pudo abrir la carpeta seleccionada")
+                  val root = findGameRoot(tree)
+                      ?: error("No encontre MIR.dll ni MIR.exe en esa carpeta")
+
+                  val dest = gameDir(ctx)
+                  if (dest.exists()) dest.deleteRecursively()
+                  dest.mkdirs()
+
+                  var count = 0
+                  fun copyDir(src: DocumentFile, out: File) {
+                      out.mkdirs()
+                      for (child in src.listFiles()) {
+                          val name = child.name ?: continue
+                          if (child.isDirectory) {
+                              copyDir(child, File(out, name))
+                          } else {
+                              ctx.contentResolver.openInputStream(child.uri)?.use { input ->
+                                  File(out, name).outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+                              }
+                              count++
+                              if (count % 10 == 0) onProgress(count, name)
+                          }
+                      }
+                  }
+                  copyDir(root, dest)
+                  onProgress(count, "listo")
+                  count
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/MainActivity.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val reqPick = 1001
+              private lateinit var status: TextView
+              private lateinit var btnPick: Button
+              private lateinit var btnPlay: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Madness Interactive Reloaded"
+                      textSize = 22f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                  }
+                  status = TextView(this).apply {
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, pad, 0, pad)
+                  }
+                  btnPick = Button(this).apply {
+                      text = "Seleccionar carpeta del juego"
+                      setOnClickListener { pickFolder() }
+                  }
+                  btnPlay = Button(this).apply {
+                      text = "Jugar"
+                      setOnClickListener { startActivity(Intent(this@MainActivity, GameActivity::class.java)) }
+                  }
+                  root.addView(title)
+                  root.addView(status)
+                  root.addView(btnPick)
+                  root.addView(btnPlay)
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ok = GameImporter.isImported(this)
+                  status.text = if (ok) "Juego importado correctamente." else "Elige la carpeta donde extrajiste el juego (la que contiene MIR.dll o MIR.exe)."
+                  btnPlay.isEnabled = ok
+              }
+
+              private fun pickFolder() {
+                  val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(intent, reqPick)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  @Suppress("DEPRECATION")
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != reqPick || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+
+                  btnPick.isEnabled = false
+                  btnPlay.isEnabled = false
+                  status.text = "Copiando archivos..."
+                  thread {
+                      val result = GameImporter.import(this, uri) { n, name ->
+                          runOnUiThread { status.text = "Copiando... $n archivos\n$name" }
+                      }
+                      runOnUiThread {
+                          btnPick.isEnabled = true
+                          result.onFailure {
+                              Toast.makeText(this, it.message ?: "Error", Toast.LENGTH_LONG).show()
+                          }
+                          refresh()
+                      }
+                  }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/GameActivity.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.content.Context
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+
+          /**
+           * PUNTO DE ENTRADA DEL RUNTIME.
+           *
+           * Ahora mismo solo muestra un diagnostico. Aqui es donde se conectaria:
+           *   1. Un runtime de .NET para linux-bionic-arm64 (carpeta filesDir/runtime)
+           *   2. Un libglfw.so falso que cree una Surface de Android (estilo PojavLauncher)
+           *   3. Un libGL traducido (GL4ES / ANGLE / Zink / MobileGlues)
+           *   4. Natives ARM64: OpenAL, SkiaSharp, FFmpeg
+           * Ver README.md.
+           */
+          class GameActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val tv = TextView(this).apply {
+                      setPadding(pad, pad, pad, pad)
+                      textSize = 13f
+                      typeface = android.graphics.Typeface.MONOSPACE
+                      text = buildReport()
+                  }
+                  setContentView(ScrollView(this).apply { addView(tv) })
+              }
+
+              private fun buildReport(): String {
+                  val game = GameImporter.gameDir(this)
+                  val runtime = File(filesDir, "runtime")
+                  val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  val gles = am.deviceConfigurationInfo.glEsVersion
+
+                  val files = game.listFiles()?.map { it.name }?.sorted() ?: emptyList()
+                  return buildString {
+                      appendLine("== Dispositivo ==")
+                      appendLine("ABIs: ${Build.SUPPORTED_ABIS.joinToString()}")
+                      appendLine("OpenGL ES: $gles")
+                      appendLine("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+                      appendLine()
+                      appendLine("== Juego ==")
+                      appendLine("Ruta: ${game.absolutePath}")
+                      appendLine("MIR.dll: ${File(game, "MIR.dll").exists()}")
+                      appendLine("MIR.exe: ${File(game, "MIR.exe").exists()}")
+                      appendLine("Archivos en raiz (${files.size}):")
+                      files.take(40).forEach { appendLine("  $it") }
+                      appendLine()
+                      appendLine("== Runtime .NET ==")
+                      appendLine("Ruta: ${runtime.absolutePath}")
+                      appendLine("Presente: ${runtime.exists()}")
+                      appendLine()
+                      appendLine("El lanzador del runtime aun no esta implementado.")
+                      appendLine("Ver README.md para los pasos pendientes.")
+                  }
+              }
+          }
+          EOF
+
+      - name: Compilar APK
+        working-directory: src
+        run: gradle assembleDebug --stacktrace
+
+      - name: Publicar en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp src/app/build/outputs/apk/debug/app-debug.apk MIR-Android.apk
+          gh release create "build-${{ github.run_number }}" MIR-Android.apk \
+            --repo "${{ github.repository }}" \
+            --title "MIR Android build ${{ github.run_number }}" \
+            --notes "APK debug generado automaticamente"
