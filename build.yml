@@ -1,0 +1,871 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Guardar firma (para poder actualizar la app sin desinstalar)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: mir-debug-keystore-v1
+
+      - name: Crear proyecto
+        run: |
+          set -e
+          mkdir -p src && cd src
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MIRAndroid"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mirandroid.launcher"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.mirandroid.launcher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+                  versionName = "0.4.0"
+
+                  ndk { abiFilters += "arm64-v8a" }
+                  externalNativeBuild {
+                      cmake { arguments("-DANDROID_STL=c++_shared") }
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake { path = file("src/main/cpp/CMakeLists.txt") }
+              }
+
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                      keepDebugSymbols += "**/*.so"
+                  }
+              }
+
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:glEsVersion="0x00030001" android:required="true" />
+
+              <application
+                  android:allowBackup="true"
+                  android:extractNativeLibs="true"
+                  android:label="MIR Android"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".LogActivity" />
+
+                  <activity
+                      android:name=".GameActivity"
+                      android:process=":game"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout" />
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(mirnative)
+
+          add_library(mirnative SHARED native-lib.cpp)
+          find_library(log-lib log)
+          target_link_libraries(mirnative ${log-lib} dl)
+          EOF
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/native-lib.cpp <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <dirent.h>
+          #include <sys/stat.h>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <string>
+          #include <set>
+
+          typedef int (*coreclr_initialize_fn)(const char*, const char*, int, const char**, const char**, void**, unsigned int*);
+          typedef int (*coreclr_execute_assembly_fn)(void*, unsigned int, int, const char**, const char*, unsigned int*);
+          typedef int (*coreclr_shutdown_2_fn)(void*, unsigned int, int*);
+          typedef int (*hostfxr_main_startupinfo_fn)(int, const char**, const char*, const char*, const char*);
+
+          static std::string jstr(JNIEnv* env, jstring s) {
+              const char* c = env->GetStringUTFChars(s, nullptr);
+              std::string r(c);
+              env->ReleaseStringUTFChars(s, c);
+              return r;
+          }
+
+          static void addDlls(const std::string& dir, std::set<std::string>& seen, std::string& tpa) {
+              DIR* d = opendir(dir.c_str());
+              if (!d) return;
+              while (dirent* e = readdir(d)) {
+                  std::string n = e->d_name;
+                  if (n.size() < 5 || n.substr(n.size() - 4) != ".dll") continue;
+                  if (!seen.insert(n).second) continue;
+                  tpa += dir + "/" + n + ":";
+              }
+              closedir(d);
+          }
+
+          // Modo 2: igual que "dotnet app.dll" usando hostfxr (el camino oficial, como Godot).
+          static int runHostfxr(const std::string& nativeDir, const std::string& dotnetRoot, const std::string& assembly) {
+              setenv("DOTNET_ROOT", dotnetRoot.c_str(), 1);
+              setenv("COREHOST_TRACE", "1", 1);
+              setenv("COREHOST_TRACE_VERBOSITY", "3", 1);
+              std::string fxr = nativeDir + "/libhostfxr.so";
+              void* lib = dlopen(fxr.c_str(), RTLD_NOW | RTLD_GLOBAL);
+              if (!lib) { printf("[native] dlopen libhostfxr.so FALLO: %s\n", dlerror()); return -1; }
+              auto fn = (hostfxr_main_startupinfo_fn)dlsym(lib, "hostfxr_main_startupinfo");
+              if (!fn) { printf("[native] no encontre hostfxr_main_startupinfo\n"); return -2; }
+              std::string hostPath = dotnetRoot + "/dotnet";
+              const char* argv[] = { hostPath.c_str(), assembly.c_str() };
+              printf("[native] llamando hostfxr_main_startupinfo (dotnetRoot=%s)\n", dotnetRoot.c_str());
+              int rc = fn(2, argv, hostPath.c_str(), dotnetRoot.c_str(), "");
+              printf("[native] hostfxr rc=%d (0x%08x)\n", rc, (unsigned)rc);
+              return rc;
+          }
+
+          extern "C" JNIEXPORT jint JNICALL
+          Java_com_mirandroid_launcher_NativeBridge_run(JNIEnv* env, jobject,
+                  jstring jNativeDir, jstring jRuntimeDir, jstring jGameDir,
+                  jstring jAssembly, jstring jHome, jstring jLog, jstring jDotnetRoot, jint mode) {
+
+              std::string nativeDir = jstr(env, jNativeDir);
+              std::string runtimeDir = jstr(env, jRuntimeDir);
+              std::string gameDir = jstr(env, jGameDir);
+              std::string assembly = jstr(env, jAssembly);
+              std::string home = jstr(env, jHome);
+              std::string logPath = jstr(env, jLog);
+              std::string dotnetRoot = jstr(env, jDotnetRoot);
+
+              int fd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+              if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+              setvbuf(stdout, nullptr, _IONBF, 0);
+              setvbuf(stderr, nullptr, _IONBF, 0);
+
+              printf("[native] modo=%d\n[native] nativeDir=%s\n[native] gameDir=%s\n[native] assembly=%s\n",
+                     (int)mode, nativeDir.c_str(), gameDir.c_str(), assembly.c_str());
+
+              mkdir(home.c_str(), 0755);
+              std::string xdg = home + "/.local";
+              mkdir(xdg.c_str(), 0755);
+              xdg += "/share";
+              mkdir(xdg.c_str(), 0755);
+              setenv("HOME", home.c_str(), 1);
+              setenv("XDG_DATA_HOME", xdg.c_str(), 1);
+              setenv("TMPDIR", home.c_str(), 1);
+              setenv("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1", 1);
+              setenv("DOTNET_TieredPGO", "0", 1);
+              if (chdir(gameDir.c_str()) != 0) printf("[native] aviso: no pude entrar a gameDir\n");
+
+              if (mode == 2) return runHostfxr(nativeDir, dotnetRoot, assembly);
+
+              // Modos 0 y 1: API coreclr_* directa
+              std::string corePath = nativeDir + "/libcoreclr.so";
+              void* lib = dlopen(corePath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+              if (!lib) {
+                  printf("[native] dlopen libcoreclr.so FALLO: %s\n", dlerror());
+                  return -1;
+              }
+              auto init = (coreclr_initialize_fn)dlsym(lib, "coreclr_initialize");
+              auto exec = (coreclr_execute_assembly_fn)dlsym(lib, "coreclr_execute_assembly");
+              auto shut = (coreclr_shutdown_2_fn)dlsym(lib, "coreclr_shutdown_2");
+              if (!init || !exec || !shut) {
+                  printf("[native] no encontre las funciones coreclr_*\n");
+                  return -2;
+              }
+
+              std::set<std::string> seen;
+              std::string tpa;
+              addDlls(runtimeDir, seen, tpa);
+              addDlls(gameDir, seen, tpa);
+              if (!tpa.empty()) tpa.pop_back();
+              printf("[native] ensamblados en TPA: %zu\n", seen.size());
+
+              std::string nativePaths = nativeDir + ":" + gameDir;
+              const char* keys[] = {
+                  "TRUSTED_PLATFORM_ASSEMBLIES", "APP_PATHS", "NATIVE_DLL_SEARCH_DIRECTORIES",
+                  "System.Globalization.Invariant", "APP_CONTEXT_BASE_DIRECTORY"
+              };
+              const char* vals[] = {
+                  tpa.c_str(), gameDir.c_str(), nativePaths.c_str(), "true", gameDir.c_str()
+              };
+
+              void* host = nullptr;
+              unsigned int domain = 0;
+              int hr = init(assembly.c_str(), "MIR", 5, keys, vals, &host, &domain);
+              printf("[native] coreclr_initialize hr=0x%08x\n", (unsigned)hr);
+              if (hr < 0) return hr;
+
+              // modo 1: argc=1 con el nombre del programa en argv[0] (convencion de Mono)
+              const char* argv[] = { assembly.c_str() };
+              int argc = (mode == 1) ? 1 : 0;
+              printf("[native] ejecutando ensamblado (argc=%d)...\n", argc);
+              unsigned int exitCode = 0;
+              hr = exec(host, domain, argc, argv, assembly.c_str(), &exitCode);
+              printf("[native] coreclr_execute_assembly hr=0x%08x exit=%u\n", (unsigned)hr, exitCode);
+
+              int latched = 0;
+              shut(host, domain, &latched);
+              return hr < 0 ? hr : (int)exitCode;
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/GameImporter.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.documentfile.provider.DocumentFile
+          import java.io.File
+
+          /** Copia la carpeta elegida por el usuario (SAF) al almacenamiento interno de la app. */
+          object GameImporter {
+
+              fun gameDir(ctx: Context): File = File(ctx.filesDir, "game")
+
+              fun isImported(ctx: Context): Boolean {
+                  val d = gameDir(ctx)
+                  return File(d, "MIR.dll").exists() || File(d, "MIR.exe").exists()
+              }
+
+              /** Devuelve la carpeta raiz del juego (la elegida, o una subcarpeta directa que contenga MIR.dll/exe). */
+              fun findGameRoot(tree: DocumentFile): DocumentFile? {
+                  if (looksLikeGame(tree)) return tree
+                  return tree.listFiles().firstOrNull { it.isDirectory && looksLikeGame(it) }
+              }
+
+              private fun looksLikeGame(dir: DocumentFile): Boolean =
+                  dir.findFile("MIR.dll") != null || dir.findFile("MIR.exe") != null
+
+              fun import(
+                  ctx: Context,
+                  treeUri: Uri,
+                  onProgress: (copiedFiles: Int, currentName: String) -> Unit
+              ): Result<Int> = runCatching {
+                  val tree = DocumentFile.fromTreeUri(ctx, treeUri)
+                      ?: error("No se pudo abrir la carpeta seleccionada")
+                  val root = findGameRoot(tree)
+                      ?: error("No encontre MIR.dll ni MIR.exe en esa carpeta")
+
+                  val dest = gameDir(ctx)
+                  if (dest.exists()) dest.deleteRecursively()
+                  dest.mkdirs()
+
+                  var count = 0
+                  fun copyDir(src: DocumentFile, out: File) {
+                      out.mkdirs()
+                      for (child in src.listFiles()) {
+                          val name = child.name ?: continue
+                          if (name == "MIR-win-x64.zip") continue
+                          if (child.isDirectory) {
+                              copyDir(child, File(out, name))
+                          } else {
+                              ctx.contentResolver.openInputStream(child.uri)?.use { input ->
+                                  File(out, name).outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+                              }
+                              count++
+                              if (count % 10 == 0) onProgress(count, name)
+                          }
+                      }
+                  }
+                  copyDir(root, dest)
+                  onProgress(count, "listo")
+                  count
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/NativeBridge.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          object NativeBridge {
+              init { System.loadLibrary("mirnative") }
+
+              /** mode: 0 = coreclr directo, 1 = coreclr directo con argc=1, 2 = hostfxr (como "dotnet app.dll") */
+              external fun run(
+                  nativeDir: String,
+                  runtimeDir: String,
+                  gameDir: String,
+                  assemblyPath: String,
+                  homeDir: String,
+                  logPath: String,
+                  dotnetRoot: String,
+                  mode: Int
+              ): Int
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/RuntimeInstaller.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.content.Context
+          import android.system.Os
+          import java.io.File
+
+          /** Extrae el runtime de .NET (assets/runtime) y arma una carpeta tipo "dotnet" para hostfxr. */
+          object RuntimeInstaller {
+
+              fun runtimeDir(ctx: Context) = File(ctx.filesDir, "runtime")
+              fun dotnetRoot(ctx: Context) = File(ctx.filesDir, "dotnet")
+              fun helloDir(ctx: Context) = File(ctx.filesDir, "hello")
+              fun logFile(ctx: Context) = File(ctx.filesDir, "log.txt")
+              fun homeDir(ctx: Context) = File(ctx.filesDir, "userdata")
+
+              @Suppress("DEPRECATION")
+              fun ensure(ctx: Context) {
+                  val rt = runtimeDir(ctx)
+                  val marker = File(rt, ".installed")
+                  val ver = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionCode.toString()
+                  if (!(marker.exists() && marker.readText() == ver)) {
+                      rt.deleteRecursively()
+                      rt.mkdirs()
+                      for (n in ctx.assets.list("runtime") ?: emptyArray()) {
+                          copyAsset(ctx, "runtime/$n", File(rt, n))
+                      }
+                      marker.writeText(ver)
+                  }
+
+                  // Enlaces a las librerias nativas (viven en la carpeta de libs de la app)
+                  val native = File(ctx.applicationInfo.nativeLibraryDir)
+                  val wanted = (native.list() ?: emptyArray()).filter {
+                      it == "libhostpolicy.so" || it == "libcoreclr.so" || it.startsWith("libSystem.")
+                  }
+                  for (n in wanted) {
+                      val link = File(rt, n)
+                      link.delete()
+                      Os.symlink(File(native, n).absolutePath, link.absolutePath)
+                  }
+
+                  // Carpeta con forma de instalacion de dotnet: dotnet/shared/Microsoft.NETCore.App/<version> -> runtime
+                  val netVer = runCatching { ctx.assets.open("runtime-version.txt").bufferedReader().readText().trim() }
+                      .getOrDefault("9.0.0")
+                  val fw = File(dotnetRoot(ctx), "shared/Microsoft.NETCore.App")
+                  fw.mkdirs()
+                  val verDir = File(fw, netVer)
+                  verDir.delete()
+                  Os.symlink(rt.absolutePath, verDir.absolutePath)
+
+                  val h = helloDir(ctx)
+                  h.mkdirs()
+                  copyAsset(ctx, "Hello.dll", File(h, "Hello.dll"))
+                  for (n in listOf("Hello.runtimeconfig.json", "Hello.deps.json")) {
+                      runCatching { copyAsset(ctx, n, File(h, n)) }
+                  }
+              }
+
+              private fun copyAsset(ctx: Context, asset: String, out: File) {
+                  ctx.assets.open(asset).use { i -> out.outputStream().use { o -> i.copyTo(o, 64 * 1024) } }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/MainActivity.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val reqPick = 1001
+              private lateinit var status: TextView
+              private lateinit var btnPick: Button
+              private lateinit var btnHello: Button
+              private lateinit var btnPlay: Button
+              private lateinit var btnLog: Button
+              private lateinit var btnInfo: Button
+              private lateinit var btnUi: Button
+              private lateinit var btnInterp: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Madness Interactive Reloaded"
+                      textSize = 22f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                  }
+                  status = TextView(this).apply {
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, pad, 0, pad)
+                  }
+                  btnPick = Button(this).apply {
+                      text = "Seleccionar carpeta del juego"
+                      setOnClickListener { pickFolder() }
+                  }
+                  btnHello = Button(this).apply {
+                      text = "Probar .NET (directo)"
+                      setOnClickListener { launch("hello") }
+                  }
+                  btnPlay = Button(this).apply {
+                      text = "Iniciar MIR (experimental)"
+                      setOnClickListener { launch("mir") }
+                  }
+                  btnUi = Button(this).apply {
+                      text = "Prueba A: directo con argumentos"
+                      setOnClickListener { launch("hello_args") }
+                  }
+                  btnInterp = Button(this).apply {
+                      text = "Prueba B: hostfxr (como Godot)"
+                      setOnClickListener { launch("hello_fxr") }
+                  }
+                  btnLog = Button(this).apply {
+                      text = "Ver ultimo registro"
+                      setOnClickListener { startActivity(Intent(this@MainActivity, LogActivity::class.java).putExtra("which", "log")) }
+                  }
+                  btnInfo = Button(this).apply {
+                      text = "Ver info del runtime"
+                      setOnClickListener { startActivity(Intent(this@MainActivity, LogActivity::class.java).putExtra("which", "info")) }
+                  }
+                  root.addView(title)
+                  root.addView(status)
+                  root.addView(btnPick)
+                  root.addView(btnHello)
+                  root.addView(btnUi)
+                  root.addView(btnInterp)
+                  root.addView(btnPlay)
+                  root.addView(btnLog)
+                  root.addView(btnInfo)
+                  setContentView(ScrollView(this).apply { isFillViewport = true; addView(root) })
+                  refresh()
+              }
+
+              private fun launch(mode: String) {
+                  startActivity(Intent(this, GameActivity::class.java).putExtra("mode", mode))
+              }
+
+              private fun refresh() {
+                  val ok = GameImporter.isImported(this)
+                  status.text = if (ok) "Juego importado correctamente."
+                  else "Elige la carpeta donde extrajiste el juego (la que contiene MIR.dll o MIR.exe)."
+                  btnPlay.isEnabled = ok
+              }
+
+              private fun pickFolder() {
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), reqPick)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  @Suppress("DEPRECATION")
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != reqPick || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+
+                  btnPick.isEnabled = false
+                  btnPlay.isEnabled = false
+                  status.text = "Copiando archivos..."
+                  thread {
+                      val result = GameImporter.import(this, uri) { n, name ->
+                          runOnUiThread { status.text = "Copiando... $n archivos\n$name" }
+                      }
+                      runOnUiThread {
+                          btnPick.isEnabled = true
+                          result.onFailure {
+                              Toast.makeText(this, it.message ?: "Error", Toast.LENGTH_LONG).show()
+                          }
+                          refresh()
+                      }
+                  }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/GameActivity.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.View
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          /**
+           * Corre en el proceso ":game" (ver manifest).
+           * Modos: hello (coreclr directo), hello_args (directo con argc=1),
+           * hello_fxr (hostfxr), mir (el juego, usa el modo que funciono en una prueba, por defecto hostfxr).
+           */
+          class GameActivity : Activity() {
+
+              private lateinit var tv: TextView
+              private lateinit var scroll: ScrollView
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var logFile: File
+
+              private val poll = object : Runnable {
+                  override fun run() {
+                      val t = runCatching { logFile.readText() }.getOrDefault("")
+                      tv.text = if (t.length > 20000) t.takeLast(20000) else t
+                      scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                      handler.postDelayed(this, 700)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (12 * resources.displayMetrics.density).toInt()
+                  tv = TextView(this).apply {
+                      setPadding(pad, pad, pad, pad)
+                      textSize = 12f
+                      typeface = android.graphics.Typeface.MONOSPACE
+                  }
+                  scroll = ScrollView(this).apply { addView(tv) }
+                  setContentView(scroll)
+
+                  val mode = intent.getStringExtra("mode") ?: "hello"
+                  logFile = RuntimeInstaller.logFile(this)
+                  logFile.writeText("Modo: $mode\n")
+                  handler.post(poll)
+
+                  thread {
+                      try {
+                          logFile.appendText("Preparando runtime...\n")
+                          RuntimeInstaller.ensure(this)
+                          runNative(mode)
+                      } catch (t: Throwable) {
+                          logFile.appendText("\n[error Kotlin] $t\n")
+                      }
+                  }
+              }
+
+              private fun runNative(mode: String) {
+                  try {
+                      val prefs = getSharedPreferences("mir", MODE_PRIVATE)
+                      val nativeDir = applicationInfo.nativeLibraryDir
+                      val runtimeDir = RuntimeInstaller.runtimeDir(this).absolutePath
+                      val gameDir: String
+                      val asm: String
+                      if (mode == "mir") {
+                          val g = GameImporter.gameDir(this)
+                          gameDir = g.absolutePath
+                          asm = File(g, "MIR.dll").absolutePath
+                      } else {
+                          val h = RuntimeInstaller.helloDir(this)
+                          gameDir = h.absolutePath
+                          asm = File(h, "Hello.dll").absolutePath
+                      }
+                      val flags = when (mode) {
+                          "hello" -> 0
+                          "hello_args" -> 1
+                          "hello_fxr" -> 2
+                          else -> prefs.getInt("best_mode", 2)
+                      }
+                      val code = NativeBridge.run(
+                          nativeDir, runtimeDir, gameDir, asm,
+                          RuntimeInstaller.homeDir(this).absolutePath, logFile.absolutePath,
+                          RuntimeInstaller.dotnetRoot(this).absolutePath, flags
+                      )
+                      logFile.appendText("\n[run devolvio $code]\n")
+                      if (mode.startsWith("hello") && runCatching { logFile.readText().contains("PRUEBA OK") }.getOrDefault(false)) {
+                          prefs.edit().putInt("best_mode", flags).apply()
+                          logFile.appendText("[modo $flags funciona: se usara para iniciar MIR]\n")
+                      }
+                  } catch (t: Throwable) {
+                      logFile.appendText("\n[error Kotlin] $t\n")
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  // el runtime solo se puede iniciar una vez por proceso
+                  android.os.Process.killProcess(android.os.Process.myPid())
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/mirandroid/launcher
+          cat > app/src/main/java/com/mirandroid/launcher/LogActivity.kt <<'EOF'
+          package com.mirandroid.launcher
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.app.ApplicationExitInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          /** which = "log" (ultimo registro + causa del crash) o "info" (contenido del runtime). */
+          class LogActivity : Activity() {
+
+              private lateinit var tv: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (12 * resources.displayMetrics.density).toInt()
+                  tv = TextView(this).apply {
+                      setPadding(pad, pad, pad, pad)
+                      textSize = 12f
+                      typeface = android.graphics.Typeface.MONOSPACE
+                      setTextIsSelectable(true)
+                      text = "Cargando..."
+                  }
+                  setContentView(ScrollView(this).apply { addView(tv) })
+                  val which = intent.getStringExtra("which") ?: "log"
+                  thread {
+                      val t = runCatching { if (which == "info") buildInfo() else buildLog() }
+                          .getOrElse { "error: $it" }
+                      runOnUiThread { tv.text = t }
+                  }
+              }
+
+              private fun buildInfo(): String = buildString {
+                  appendLine("== libs nativas en la app ==")
+                  val nd = File(applicationInfo.nativeLibraryDir)
+                  appendLine(nd.absolutePath)
+                  nd.listFiles()?.sortedBy { it.name }?.forEach { appendLine("${it.name}  ${it.length() / 1024}KB") }
+                  appendLine()
+                  appendLine("== runtime-info (generado al compilar) ==")
+                  append(runCatching { assets.open("runtime-info.txt").bufferedReader().readText() }
+                      .getOrDefault("(no existe runtime-info.txt)"))
+              }
+
+              private fun buildLog(): String = buildString {
+                  val f = RuntimeInstaller.logFile(this@LogActivity)
+                  val t = if (f.exists()) f.readText() else "(sin registro todavia)"
+                  appendLine(if (t.length > 12000) t.takeLast(12000) else t)
+                  appendLine()
+                  appendLine("== Causa del cierre segun Android ==")
+                  appendLine(exitInfo())
+                  appendLine()
+                  appendLine("== logcat (filtrado) ==")
+                  appendLine(logcat())
+              }
+
+              private fun exitInfo(): String {
+                  if (Build.VERSION.SDK_INT < 30) return "(Android 10 o menor: no disponible)"
+                  val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                  val list = am.getHistoricalProcessExitReasons(packageName, 0, 6)
+                  val sb = StringBuilder()
+                  var shownTrace = false
+                  for (i in list) {
+                      sb.appendLine("proceso=${i.processName} razon=${i.reason} estado=${i.status} ${i.description ?: ""}")
+                      if (!shownTrace && i.reason == ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                          shownTrace = true
+                          try {
+                              val bytes = i.traceInputStream?.use { it.readBytes() }
+                              if (bytes != null) sb.appendLine(printable(bytes))
+                          } catch (e: Exception) {
+                              sb.appendLine("(error leyendo trace: $e)")
+                          }
+                      }
+                  }
+                  return sb.toString()
+              }
+
+              /** El tombstone viene en protobuf: extraemos las cadenas de texto utiles (librerias, funciones, mensaje). */
+              private fun printable(b: ByteArray): String {
+                  val runs = ArrayList<String>()
+                  val cur = StringBuilder()
+                  for (x in b) {
+                      val c = x.toInt() and 0xff
+                      if (c in 32..126) cur.append(c.toChar())
+                      else { if (cur.length >= 5) runs.add(cur.toString()); cur.setLength(0) }
+                  }
+                  if (cur.length >= 5) runs.add(cur.toString())
+                  val keep = Regex("lib|/|::|_Z|abort|Abort|signal|terminat|FORTIFY|mono|clr|promise|mutex|Fatal")
+                  val out = StringBuilder("-- tombstone (cadenas) --\n")
+                  var last = ""
+                  for (r in runs) {
+                      if (r != last && keep.containsMatchIn(r)) { out.appendLine(r.take(200)); last = r }
+                      if (out.length > 7000) break
+                  }
+                  return out.toString()
+              }
+
+              private fun logcat(): String = try {
+                  val pb = ProcessBuilder("logcat", "-d", "-t", "400", "-v", "brief").redirectErrorStream(true)
+                  val p = pb.start()
+                  val all = p.inputStream.bufferedReader().readLines()
+                  val re = Regex("(?i)mono|dotnet|clr|hostfxr|hostpolicy|abort|fortify|fatal|mutex|promise|signal|crash|mirandroid|libc")
+                  val f = all.filter { re.containsMatchIn(it) }
+                  "(total lineas: ${all.size}, relevantes: ${f.size})\n" + f.takeLast(60).joinToString("\n") { it.take(220) }
+              } catch (e: Exception) { "(sin logcat: $e)" }
+          }
+          EOF
+          mkdir -p hello
+          cat > hello/hello.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net9.0</TargetFramework>
+              <AssemblyName>Hello</AssemblyName>
+              <ImplicitUsings>disable</ImplicitUsings>
+              <InvariantGlobalization>true</InvariantGlobalization>
+            </PropertyGroup>
+          </Project>
+          EOF
+          mkdir -p hello
+          cat > hello/Program.cs <<'EOF'
+          using System;
+          using System.Runtime.InteropServices;
+
+          Console.WriteLine("Hola desde .NET " + Environment.Version);
+          Console.WriteLine("Framework: " + RuntimeInformation.FrameworkDescription);
+          Console.WriteLine("SO: " + RuntimeInformation.OSDescription + " / " + RuntimeInformation.ProcessArchitecture);
+          Console.WriteLine("LocalAppData: " + Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+          Console.WriteLine("PRUEBA OK");
+          EOF
+
+      - name: Descargar runtime de .NET para Android
+        run: |
+          set -e
+          cd src
+          BASE=https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.linux-bionic-arm64
+          VER=$(curl -fsSL $BASE/index.json | jq -r '.versions[]' | grep -E '^9\.0\.[0-9]+$' | sort -V | tail -1)
+          echo "Runtime .NET: $VER"
+          curl -fsSL "$BASE/$VER/microsoft.netcore.app.runtime.linux-bionic-arm64.$VER.nupkg" -o rt.nupkg
+          mkdir rt && unzip -q rt.nupkg -d rt
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/runtime
+          echo "$VER" > app/src/main/assets/runtime-version.txt
+          find rt -path '*/native/*' -name '*.so' -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
+          find rt -path '*/lib/net9.0/*' -name '*.dll' -exec cp {} app/src/main/assets/runtime/ \;
+          echo "Nativas: $(ls app/src/main/jniLibs/arm64-v8a | wc -l)  Administradas: $(ls app/src/main/assets/runtime | wc -l)"
+          ls app/src/main/jniLibs/arm64-v8a
+          J=app/src/main/jniLibs/arm64-v8a
+          {
+            echo "Version runtime: $VER"
+            echo "== archivos nativos =="; ls -l $J
+            for f in $(ls $J); do
+              echo "== NEEDED de $f =="; readelf -d $J/$f 2>/dev/null | grep NEEDED || true
+            done
+            echo "== simbolos coreclr/mono/hostfxr en libcoreclr.so =="
+            readelf -Ws --dyn-syms $J/libcoreclr.so | grep -Ei "coreclr_|monovm|mono_jit_init|hostfxr" | awk '{print $8}' | head -40 || true
+            echo "== otros archivos del paquete (no dll/so) =="
+            find rt -type f ! -name '*.dll' ! -name '*.so' | head -40
+          } > app/src/main/assets/runtime-info.txt
+          test -f app/src/main/jniLibs/arm64-v8a/libcoreclr.so
+
+      - name: Compilar Hello.dll
+        run: |
+          set -e
+          cd src/hello
+          dotnet publish -c Release -o out
+          cp out/Hello.dll ../app/src/main/assets/Hello.dll
+          cp out/Hello.runtimeconfig.json ../app/src/main/assets/
+          cp out/Hello.deps.json ../app/src/main/assets/ || true
+          ls out
+
+      - name: Compilar APK
+        working-directory: src
+        run: gradle assembleDebug --stacktrace
+
+      - name: Publicar en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp src/app/build/outputs/apk/debug/app-debug.apk MIR-Android.apk
+          gh release create "build-${{ github.run_number }}" MIR-Android.apk \
+            --repo "${{ github.repository }}" \
+            --title "MIR Android build ${{ github.run_number }}" \
+            --notes "APK debug generado automaticamente"
